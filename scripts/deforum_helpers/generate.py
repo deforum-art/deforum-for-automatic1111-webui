@@ -3,6 +3,7 @@ import PIL #HOTFIXISSUE#33 needed for instruction to generate negative mask.
 from PIL import Image, ImageOps
 import requests
 import numpy as np
+from math import ceil
 import torchvision.transforms.functional as TF
 from pytorch_lightning import seed_everything
 import os
@@ -22,9 +23,10 @@ from .callback import SamplerCallback
 #Webui
 import cv2
 from .animation import sample_from_cv2, sample_to_cv2
-from modules import processing
+from modules import processing, masking
+from modules import shared
 from modules.shared import opts, sd_model
-from modules.processing import process_images, StableDiffusionProcessingTxt2Img
+from modules.processing import process_images, StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img
 import logging
 
 #MASKARGSEXPANSION 
@@ -94,7 +96,69 @@ def prepare_mask(mask_input, mask_shape, mask_brightness_adjust=1.0, mask_contra
         mask = PIL.ImageOps.invert(mask)
     
     return mask
+
+# Resets the pipeline object as recomended by kabachuha to simplify resets for additional passes
+def reset_pipeline(args, prompt, negative_prompt):
+    # Setup the pipeline
+    p = StableDiffusionProcessingImg2Img(
+        sd_model=sd_model,
+        outpath_samples = opts.outdir_samples or opts.outdir_img2img_samples,
+        outpath_grids = opts.outdir_grids or opts.outdir_img2img_grids,
+        #prompt=prompt, 
+        #negative_prompt=negative_prompt,
+        #styles=[prompt_style, prompt_style2], 
+        seed=args.seed,
+        subseed=args.subseed,
+        subseed_strength=args.subseed_strength,
+        seed_resize_from_h=args.seed_resize_from_h,
+        seed_resize_from_w=args.seed_resize_from_w,
+        #seed_enable_extras=args.seed_enable_extras,
+        sampler_name = args.sampler,
+        batch_size=args.n_batch,
+        n_iter=1,
+        cfg_scale=args.scale,
+        width=args.W,
+        height=args.H,
+        restore_faces=args.restore_faces,
+        tiling=args.tiling,
+        #init_images=[image], # Assigned during generation 
+        mask=None, # Assigned during generation 
+        mask_blur=args.mask_overlay_blur,
+        #resize_mode=resize_mode, #TODO There are several settings to this and it may 
+        #inpainting_fill=args.fill, # Assign during generation
+        #inpaint_full_res=args.full_res_mask, # Assign during generation
+        #inpaint_full_res_padding=inpaint_full_res_padding, # Assign during generation
+        #inpainting_mask_invert=inpainting_mask_invert, # Assign during generation
+        do_not_save_samples=not args.save_sample_per_step,
+        do_not_save_grid=not args.make_grid,
+    )
+    p.restore_faces = args.restore_faces
+    p.tiling = args.tiling
+    p.enable_hr = args.enable_hr
+    p.firstphase_width = args.firstphase_width
+    p.firstphase_height = args.firstphase_height
+    p.seed_enable_extras = args.seed_enable_extras
+    p.subseed = args.subseed
+    p.subseed_strength = args.subseed_strength
+    p.seed_resize_from_w = args.seed_resize_from_w
+    p.seed_resize_from_h = args.seed_resize_from_h
+    p.ddim_eta = args.ddim_eta
+
+    # Below settings which have conditions or symbols that dont work in the p object constructor
+    p.extra_generation_params["Mask blur"] = args.mask_overlay_blur
+
+    p.steps = args.steps
+    if opts.img2img_fix_steps:
+        p.denoising_strength = 1 / (1 - args.strength + 1.0/args.steps) #see https://github.com/deforum-art/deforum-for-automatic1111-webui/issues/3
+    else:
+        p.denoising_strength = 1 - args.strength
     
+    # The prompts are precomputed as the math functions can be quite resource heavy
+    # and also not to log things twice
+    p.prompt = prompt
+    p.negative_prompt = negative_prompt
+    return p
+
 def generate(args, anim_args, root, frame = 0, return_sample=False):
     import re
     assert args.prompt is not None
@@ -108,44 +172,18 @@ def generate(args, anim_args, root, frame = 0, return_sample=False):
             """, re.VERBOSE)
     
     parsed_prompt = re.sub(math_parser, lambda m: str(parse_weight(m, frame)), args.prompt)
-    
-    # Setup the pipeline
-    p = root.p
-    
-    os.makedirs(args.outdir, exist_ok=True)
-    p.batch_size = args.n_samples
-    p.width = args.W
-    p.height = args.H
-    p.seed = args.seed
-    p.subseed=args.subseed
-    p.subseed_strength=args.subseed_strength
-    p.do_not_save_samples = not args.save_sample_per_step
-    p.do_not_save_grid = not args.make_grid
-    p.sd_model=sd_model
-    p.sampler_name = args.sampler
-    p.mask_blur = args.mask_overlay_blur
-    p.extra_generation_params["Mask blur"] = args.mask_overlay_blur
-    p.n_iter = 1
-    p.steps = args.steps
-    p.denoising_strength = 1 - args.strength
-    p.cfg_scale = args.scale
-    p.seed_enable_extras = args.seed_enable_extras
 
-    # FIXME better color corrections as match histograms doesn't seem to be fully working
-    if root.color_corrections is not None:
-        p.color_corrections = root.color_corrections
-    p.outpath_samples = root.outpath_samples
-    p.outpath_grids = root.outpath_samples
-    
     prompt_split = parsed_prompt.split("--neg")
     if len(prompt_split) > 1:
-        p.prompt, p.negative_prompt = parsed_prompt.split("--neg") #TODO: add --neg to vanilla Deforum for compat
-        print(f'Positive prompt:{p.prompt}')
-        print(f'Negative prompt:{p.negative_prompt}')
+        prompt, negative_prompt = parsed_prompt.split("--neg") #TODO: add --neg to vanilla Deforum for compat
+        print(f'Positive prompt:{prompt}')
+        print(f'Negative prompt:{negative_prompt}')
     else:
-        p.prompt = prompt_split[0]
-        print(f'Positive prompt:{p.prompt}')
-        p.negative_prompt = ""
+        prompt = prompt_split[0]
+        print(f'Positive prompt:{prompt}')
+        negative_prompt = ""
+    
+    p = reset_pipeline(args, prompt, negative_prompt)
     
     if not args.use_init and args.strength > 0 and args.strength_0_no_init:
         print("\nNo init image, but strength > 0. Strength has been auto set to 0, since use_init is False.")
@@ -160,6 +198,91 @@ def generate(args, anim_args, root, frame = 0, return_sample=False):
         open_cv_image = sample_to_cv2(args.init_sample)
         img = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2RGB)
         init_image = Image.fromarray(img)
+
+        if anim_args.border == 'smart':
+            
+            # Inpaint changed parts of the image
+            # that's, to say, zeros we got after the transformations
+
+            # Its important to note that the loop below is creating a mask for inpainting 0's
+            # This mask however can mask areas that were intended to be black
+            # Suggest a fix to send the inpainting mask as an argument,
+            # before the add_noise and contrast_adjust is applied
+            mask_image = init_image.convert('L')
+            for x in range(mask_image.width):
+                for y in range(mask_image.height):
+                    if mask_image.getpixel((x,y)) < 4:
+                        mask_image.putpixel((x,y), 255)
+                    else:
+                        mask_image.putpixel((x,y), 0)
+            
+            # blend the two masks
+            if root.warp_mask is not None:
+                # TODO: I guess there is some built-in function for this
+                warp_mask_image = Image.fromarray(root.warp_mask).convert('L')
+                for x in range(mask_image.width):
+                    for y in range(mask_image.height):
+                        if mask_image.getpixel((x,y)) > 0 or warp_mask_image.getpixel((x,y)) > 0:
+                            mask_image.putpixel((x,y), 255)
+                        else:
+                            mask_image.putpixel((x,y), 0)
+                root.warp_mask = None
+            
+            mask = prepare_mask(mask_image, 
+                                    (args.W, args.H), 
+                                    args.mask_contrast_adjust, 
+                                    args.mask_brightness_adjust, 
+                                    invert_mask=False)
+            
+            # HACK: this is a hacky check to make the mask work with the new inpainting code
+            crop_region = masking.get_crop_region(np.array(mask_image), args.full_res_mask_padding)
+            crop_region = masking.expand_crop_region(crop_region, args.W, args.H, mask_image.width, mask_image.height)
+            x1, y1, x2, y2 = crop_region
+
+            too_small = (x2 - x1) < 1 or (y2 - y1) < 1
+
+            if not too_small:
+                p.do_not_save_samples=True,         
+                p.inpainting_fill = args.smart_border_fill_mode 
+                p.inpaint_full_res= args.full_res_mask 
+                p.inpaint_full_res_padding = args.full_res_mask_padding 
+                p.init_images = [init_image]
+                p.image_mask = mask_image
+
+                #color correction for zeroes inpainting
+                p.color_corrections = [processing.setup_color_correction(init_image)]
+
+                print("Smart mode: inpainting border")
+
+                processed = processing.process_images(p)
+                init_image = processed.images[0].convert('RGB')
+
+                p = reset_pipeline(args, prompt, negative_prompt) # This should reset as to not lose prompts and base args in next pass
+                p.init_images = [init_image] # preserve the init image that we just generated, as we reset the p object
+
+                processed = None # This needs to be none so that the normal pass will continue
+                mask_image = None # Could be using a standard mask in addition to this pass, so this needs to be reset also
+
+                # Below are the settings that started stacking up
+                #p.inpainting_mask_invert = False
+                #p.sd_model=sd_model
+                #p.color_corrections = None
+                #p.image_mask = None
+                #p.inpainting_fill = 1
+                #p.sd_model=sd_model
+
+                # This setting allowed the diffusion to continue however we decided that resetting the p object 
+                # was safer
+                #p.mask = None
+            else:
+                # fix tqdm total steps if we don't have to conduct a second pass
+                tqdm_instance = shared.total_tqdm
+                current_total = tqdm_instance.getTotal()
+                if current_total != -1:
+                    tqdm_instance.updateTotal(current_total - int(ceil(args.steps * (1-args.strength))))
+            
+            mask = None
+            mask_image = None
     elif args.use_init and args.init_image != None and args.init_image != '':
         init_image, mask_image = load_img(args.init_image, 
                                           shape=(args.W, args.H),  
@@ -218,7 +341,7 @@ def generate(args, anim_args, root, frame = 0, return_sample=False):
         assert not ( (args.use_mask and args.overlay_mask) and (args.init_sample is None and init_image is None)), "Need an init image when use_mask == True and overlay_mask == True"
         
         p.init_images = [init_image]
-        p.image_mask = mask
+        p.image_mask = mask_image
 
         print(f"seed={p.seed}; subseed={p.subseed}; subseed_strength={p.subseed_strength}; denoising_strength={p.denoising_strength}; steps={p.steps}; cfg_scale={p.cfg_scale}")
         processed = processing.process_images(p)
